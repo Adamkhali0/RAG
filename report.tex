@@ -1,0 +1,199 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{geometry}
+\usepackage{hyperref}
+\geometry{margin=1in}
+
+\title{Technical Report on the Introductory Statistics RAG Pipeline}
+\author{TP NLP RAG Project}
+\date{November 2025}
+
+\begin{document}
+\maketitle
+
+\section{Overview}
+This document summarises the design and current status of the Retrieval-Augmented Generation (RAG) pipeline implemented for introductory statistics materials. Each section (Q1--Q5) corresponds to a milestone in the project specification. For every component we describe the techniques applied, the reasoning behind major architectural choices, and the issues encountered during integration and testing.
+
+The current corpus consists of two PDF chapters focused on estimation methods. All components operate on CPU-only hardware, which heavily influenced decisions around model size, caching, and batching. The pipeline is orchestrated through both a Python API (under \texttt{src/}) and a test harness (\texttt{test\_with\_pdfs.py}) that exercises the full end-to-end flow from document ingestion to chatbot dialogue.
+
+Configuration is centralised in \texttt{config.yaml}. Altering chunk sizes, retrieval depth, or language model parameters can therefore be achieved without modifying code. Every section below references the configuration keys that govern its behaviour.
+
+\section{Q1 -- Document Indexation Pipeline}
+\subsection*{Techniques Employed}
+The indexation stage loads PDF chapters using \texttt{PDFPlumberLoader} (exposed through LangChain's \texttt{DirectoryLoader}) in order to preserve page-level metadata such as filename and page number. Text is segmented with \texttt{RecursiveCharacterTextSplitter} configured for 1000-character chunks with 200-character overlap to balance context coherence and retrieval granularity. Embeddings are generated via the \texttt{sentence-transformers/all-MiniLM-L6-v2} model wrapped in \texttt{HuggingFaceEmbeddings}; a shared cache avoids redundant model downloads. The resulting vectors are stored in a FAISS index persisted to disk so that subsequent runs can skip expensive recomputation.
+
+\subsection*{Key Functions}
+\begin{itemize}
+  \item \texttt{DocumentIndexer.load\_documents} --- wraps \texttt{DirectoryLoader} to ingest PDFs while enriching metadata.
+  \item \texttt{DocumentIndexer.split\_documents} --- applies the recursive splitter and filters quiz-related lines before chunking.
+  \item \texttt{DocumentIndexer.create\_vector\_store} --- builds and persists the FAISS index with MiniLM embeddings.
+  \item \texttt{DocumentIndexer.index\_documents} --- orchestrates the full load--split--embed pipeline used in CLI and tests.
+\end{itemize}
+
+\subsection*{Rationale}
+\begin{itemize}
+  \item \textbf{PDFPlumberLoader} was selected for more robust handling of multi-column statistical textbooks compared to \texttt{PyPDFLoader}; it also retains figure captions that are occasionally referenced in the narrative.
+  \item The chunk size/overlap pair was tuned after observing the large amount of mathematical notation in the source documents; moderate overlap lowers the risk of cutting definitions mid-way while keeping the FAISS index to 74 chunks for the current corpus.
+  \item FAISS was chosen for Windows compatibility and local persistence requirements, avoiding the Python-only in-memory implementations that previously caused crashes when reloading indices. Saving the index to \texttt{./chroma\_db} allows the CLI command \texttt{python cli.py search} to respond immediately on subsequent runs.
+  \item Caching the embedding model (via a class-level dictionary) prevents redundant initialisation when multiple components request embeddings during the same process, significantly reducing latency in the test harness.
+\end{itemize}
+
+\subsection*{Issues Observed}
+The primary issue involved noisy practice quizzes embedded within the PDFs. These sections polluted the index with multiple-choice fragments, degrading downstream answers. We mitigated this by filtering chunk lines containing markers such as ``PRACTICE QUIZ'', ``MULTIPLE CHOICE'', and learning objective identifiers before embedding. Additionally, several PDF pages were entirely blank after extraction; the splitter now drops empty documents and records the count in the logs so validation can catch unexpected text-loss.
+
+\section{Q2 -- Vector Retrieval}
+\subsection*{Techniques Employed}
+Document retrieval relies on FAISS similarity search with configurable \(k\) (default 4) and an optional score threshold. Retrieval utilities normalise various return formats (\texttt{Document} or tuple pairs) and provide helper functions to format results for debugging sessions.
+
+\subsection*{Key Functions}
+\begin{itemize}
+  \item \texttt{DocumentRetriever.search} --- primary similarity lookup, returning documents with optional scores.
+  \item \texttt{DocumentRetriever.search\_with\_relevance\_scores} --- exposes FAISS relevance scoring (0--1) where required.
+  \item \texttt{DocumentRetriever.format\_results} --- convenience formatter used in diagnostics and tests.
+  \item \texttt{DocumentRetriever.get\_relevant\_context} --- concatenates retrieved content for quick LLM queries.
+\end{itemize}
+
+\subsection*{Rationale}
+\begin{itemize}
+  \item Using the same embeddings as Q1 guarantees a consistent vector space between indexing and retrieval, enabling re-ranking without cross-model drift.
+  \item Returning both scores and metadata simplified manual verification while integrating the QA system. Inspecting page numbers in \texttt{Document.metadata} revealed recurrent noisy sections, guiding the filtering rules introduced in Q1.
+  \item Exposing multiple search flavours (raw similarity, relevance-scaled scores, context concatenation) keeps the retriever flexible for future evaluation and demonstration scripts.
+\end{itemize}
+
+\subsection*{Issues Observed}
+Despite filtering quiz sections, some descriptive/inferential statistics chunks still contained templated bullet remnants. Although retrieval correctly surfaces the relevant segments, post-processing is required in Q3 to clean the answer text. A secondary observation is that FAISS similarity scores are not bounded to \([0, 1]\); the evaluation framework therefore includes its own normalisation to avoid misinterpreting raw distance values.
+
+\section{Q3 -- Question Answering System}
+\subsection*{Techniques Employed}
+The QA pipeline fetches top documents via the retriever, trims them with a question-aware snippet selector, and constructs prompts for the \texttt{google/flan-t5-base} model through LangChain's \texttt{HuggingFacePipeline}. A dedicated prompt template enforces grounding rules, English output, sentence limits, and explicit guidance to ignore multiple-choice labels. Answer normalisation removes residual bullet markers, template braces, and quasi-experiment digressions. The system dynamically shortens context blocks to respect \texttt{llm.max\_prompt\_tokens} (default 540) using the tokenizer's \texttt{encode} method to estimate token counts.
+
+\subsection*{Key Functions}
+\begin{itemize}
+  \item \texttt{QASystem.answer\_question} --- end-to-end RAG answer routine returning text and supporting sources.
+  \item \texttt{QASystem.\_build\_context\_parts} --- question-aware context assembly with quiz filtering.
+  \item \texttt{QASystem.\_prepare\_prompt} --- token-budget-aware prompt construction.
+  \item \texttt{QASystem.normalize\_answer} --- cleans the generated response to remove artifacts.
+\end{itemize}
+
+\subsection*{Rationale}
+\begin{itemize}
+  \item \textbf{Flan-T5} was selected for its balance between quality and CPU feasibility in the classroom deployment environment; larger models (e.g., \texttt{flan-t5-large}) were tested but proved too slow without GPU acceleration.
+  \item The question-aware snippet extraction biases context towards passages containing overlapping keywords, reducing prompt length while preserving highly relevant evidence. This is critical for the experiment requirements question, where relevant sentences appear deep within a dense block of text.
+  \item Strict normalisation is necessary because the original PDFs mix narrative text with formatting artifacts (e.g., duplicated ``and and'' phrases, lettered bullets). Without this step, answers inherit clutter that confuses students.
+  \item Prompt instructions explicitly forbid hallucinations and require explicit acknowledgement when information is missing; this behaviour proved essential when early experiments used unrelated behavioural science questions.
+\end{itemize}
+
+\subsection*{Issues Observed}
+Two outstanding issues remain:
+\begin{enumerate}
+  \item The answer to ``How do descriptive and inferential statistics differ in the introduction chapter?'' occasionally includes truncated phrases. Additional cleaning of the source snippet or tailored post-processing is still planned.
+  \item LangChain has deprecated the legacy \texttt{HuggingFacePipeline} wrapper. While functional, the code now emits warnings recommending migration to \texttt{langchain-huggingface}.
+\end{enumerate}
+
+\section{Q4 -- Evaluation Framework}
+\subsection*{Techniques Employed}
+The evaluator computes three metrics: relevance, faithfulness, and completeness. Relevance blends keyword overlap, semantic similarity via MiniLM embeddings, and context overlap against the retrieved documents. Faithfulness checks alignment between answer phrases and source text, whereas completeness uses heuristic scoring for length, structure, specificity, and avoidance of refusal phrases. The evaluation utilities are wired directly into the regression script, ensuring every run produces diagnostic scores alongside qualitative outputs.
+
+\subsection*{Key Functions}
+\begin{itemize}
+  \item \texttt{RAGEvaluator.evaluate\_answer\_relevance} --- hybrid keyword/semantic/context scoring.
+  \item \texttt{RAGEvaluator.evaluate\_faithfulness} --- verifies phrase-level support within retrieved documents.
+  \item \texttt{RAGEvaluator.evaluate\_answer\_completeness} --- heuristic completeness checker.
+  \item \texttt{RAGEvaluator.evaluate\_response} --- aggregates metrics and assigns an overall grade.
+\end{itemize}
+
+\subsection*{Rationale}
+\begin{itemize}
+  \item Incorporating embeddings in the relevance score addresses paraphrasing: the ASA definition now receives a non-zero score despite limited lexical overlap. The cosine similarity computation is scaled into \([0, 1]\) for consistency with other metrics.
+  \item Context overlap ensures the answer actually reuses terms present in the retrieved evidence, discouraging hallucinations. This became particularly important once we started filtering quiz content upstream; context overlap confirms that the cleaned snippets still carry the necessary terminology.
+  \item The aggregated \texttt{evaluate\_response} output (including grade thresholds) provides stakeholders with a simple pass/fail indicator while preserving detailed sub-metrics for developers.
+\end{itemize}
+
+\subsection*{Issues Observed}
+Relevance and completeness remain heuristic and should not be treated as absolute accuracy measures. Major refactors (e.g., migrating to prompt-evaluators or LLM-based grading) could provide richer diagnostics but were deferred to keep evaluation deterministic and lightweight. Additionally, the evaluator currently instantiates its own retriever for context overlap; this adds a small overhead (~0.5s) and could be optimised by reusing cached retrieval results from Q3.
+
+\section{Q5 -- Conversational Chatbot}
+\subsection*{Techniques Employed}
+The chatbot wraps Q3 with conversational history management. It shares the question-aware context builder, constrains history length, and employs a chatbot-specific prompt that emphasises conversational tone while respecting context and citation rules. Conversation turns are timestamped to support future UX features (such as displaying session transcripts).
+
+\subsection*{Key Functions}
+\begin{itemize}
+  \item \texttt{Chatbot.chat} --- handles retrieval, prompt preparation, answer normalisation, and history updates per turn.
+  \item \texttt{ConversationHistory.add\_turn} --- persists question/answer pairs with timestamps.
+  \item \texttt{Chatbot.\_prepare\_prompt} --- combines history, context, and system instructions within token limits.
+  \item \texttt{Chatbot.reset\_conversation} and \texttt{Chatbot.get\_conversation\_history} --- support CLI tooling and tests.
+\end{itemize}
+
+\subsection*{Rationale}
+\begin{itemize}
+  \item Reusing the QA system ensures consistent grounding and answer formatting across single-turn and multi-turn settings, reducing maintenance overhead.
+  \item Limiting history to five turns prevents token budgets from being exceeded when operating on CPU-only hardware while still allowing short tutoring sessions.
+  \item The prompt template explicitly instructs the model to reference earlier turns only when relevant. This avoids the common failure mode where summarised history causes the model to drift away from the immediate question.
+\end{itemize}
+
+\subsection*{Issues Observed}
+The chatbot inherits the descriptive/inferential truncation bug from Q3. Because both systems share normalisation logic, improvements to the QA cleaning step will automatically propagate to the chatbot.
+
+\section{Configuration and Tooling}
+\subsection*{Configuration Keys}
+Key configuration entries and their roles:
+\begin{itemize}
+  \item \texttt{document\_processing.chunk\_size} and \texttt{chunk\_overlap} govern the splitter behaviour described in Q1.
+  \item \texttt{retrieval.top\_k} and \texttt{retrieval.score\_threshold} influence FAISS queries in Q2.
+  \item \texttt{llm.max\_context\_docs}, \texttt{max\_document\_length}, and \texttt{max\_prompt\_tokens} control prompt assembly in Q3 and Q5.
+  \item \texttt{chatbot.max\_history} sets the conversation window size.
+\end{itemize}
+
+\subsection*{Command-Line Interface and Tests}
+The project ships with \texttt{cli.py}, exposing the commands \texttt{index}, \texttt{retrieve}, \texttt{ask}, \texttt{evaluate}, and \texttt{chat}. For automated validation we rely on \texttt{test\_with\_pdfs.py}, which performs the following sequence:
+\begin{enumerate}
+  \item Rebuild the FAISS index (Q1).
+  \item Execute representative retrieval queries (Q2).
+  \item Run three QA prompts (Q3).
+  \item Evaluate the ASA definition answer (Q4).
+  \item Simulate a three-turn chat session (Q5).
+\end{enumerate}
+Running \texttt{python -u test\_with\_pdfs.py} from the repository root produces detailed logs suitable for regression testing.
+
+  \section{Repository Assets and File Responsibilities}
+  This section documents every file delivered with the project and explains its role in the overall workflow.
+
+  \subsection*{Root-Level Files}
+  \begin{itemize}
+    \item \texttt{cli.py} --- command-line entry point used to trigger indexing, retrieval, QA, evaluation, and chatbot flows without opening a notebook.
+    \item \texttt{config.yaml} --- central configuration file; overrides chunking, retrieval, and LLM parameters without editing source code.
+    \item \texttt{requirements.txt} --- pinned runtime dependencies (LangChain, sentence-transformers, FAISS bindings, transformers, etc.).
+    \item \texttt{report.tex} --- this technical report describing architecture, design decisions, and testing evidence.
+    \item \texttt{test\_with\_pdfs.py} --- scripted end-to-end regression covering Q1--Q5; useful for quick validation after any change.
+    \item \texttt{TP - Retrieval Augmented Generation (RAG) (1).pdf} --- the original assignment brief kept for reference.
+    \item \texttt{.gitignore} --- standard Git ignore rules (Python cache folders, environment artifacts).
+    \item \texttt{null} --- placeholder kept from the original workspace; harmless but retained to mirror the delivered archive structure.
+  \end{itemize}
+
+  \subsection*{Data and Persistence}
+  \begin{itemize}
+    \item \texttt{data/} --- contains the curated introductory statistics PDFs that seed the indexation pipeline.
+    \item \texttt{chroma\_db/} --- persisted FAISS index generated by \texttt{DocumentIndexer.create\_vector\_store}; rebuilds automatically if deleted.
+    \item \texttt{adamenv/} --- Python virtual environment snapshot with preinstalled dependencies for reproducible execution on Windows.
+  \end{itemize}
+
+  \subsection*{Source Package \texttt{src/}}
+  \begin{itemize}
+    \item \texttt{\_\_init\_\_.py} --- marks the directory as a package so modules can be imported as \texttt{src.*}.
+    \item \texttt{config\_loader.py} --- lightweight loader for \texttt{config.yaml} that supports dotted key access and centralises file handling.
+    \item \texttt{document\_indexer.py} --- implementation of the end-to-end indexing pipeline (loading, splitting, embedding, persisting).
+    \item \texttt{document\_retriever.py} --- vector search utilities layered on FAISS, offering score formatting and context assembly helpers.
+    \item \texttt{qa\_system.py} --- core RAG question-answering orchestration, including prompt templating, token-budget management, and output cleaning.
+    \item \texttt{rag\_evaluator.py} --- evaluation engine computing relevance, faithfulness, and completeness metrics with optional grading.
+    \item \texttt{chatbot.py} --- multi-turn conversational agent built on top of the QA system with history handling.
+  \end{itemize}
+
+  \subsection*{Test Harness Responsibilities}
+  The regression script \texttt{test\_with\_pdfs.py} glues all modules together: it triggers indexing, runs sample queries, evaluates answers, and demonstrates the chatbot. Keeping this as a plain Python script satisfies the ``no notebooks'' constraint while providing a reproducible artefact for markers.
+
+\section{Summary and Future Work}
+The project successfully delivers a fully reproducible RAG stack: documents are indexed with cleaned chunks, retrieval surfaces relevant evidence, QA produces grounded answers, evaluation quantifies quality, and the chatbot extends functionality to multi-turn dialogues. Remaining work includes refining the descriptive vs.~inferential explanation, migrating deprecated LangChain components, and optionally expanding the evaluation framework with more sophisticated grading techniques. We also plan to augment the corpus with broader introductory statistics chapters to improve coverage and to revisit chunk filtering rules once additional document types are introduced.
+
+\end{document}

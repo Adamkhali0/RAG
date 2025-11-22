@@ -1,0 +1,54 @@
+# Configuration file for RAG System
+
+# Vector Store Configuration
+vector_store:
+  type: "chromadb"
+  persist_directory: "./chroma_db"
+  collection_name: "document_collection"
+
+# Embedding Model Configuration
+embedding_model:
+  provider: "huggingface"
+  model_name: "sentence-transformers/all-MiniLM-L6-v2"
+  device: "cpu"  # Change to "cuda" if GPU is available
+
+# Document Processing Configuration
+document_processing:
+  data_directory: "./data"
+  chunk_size: 1000
+  chunk_overlap: 200
+  separator: "\n\n"
+
+# LLM Configuration
+llm:
+  provider: "huggingface"
+  model_name: "google/flan-t5-base"  # Open-source model
+  temperature: 0.7
+  max_length: 512
+  max_new_tokens: 160
+  max_context_docs: 2
+  max_document_length: 320
+  max_prompt_tokens: 540
+  do_sample: false
+  num_beams: 4
+
+# Retrieval Configuration
+retrieval:
+  top_k: 4
+  search_type: "similarity"
+  score_threshold: 0.0
+
+# Evaluation Configuration
+evaluation:
+  metrics:
+    - "relevance"
+    - "faithfulness"
+    - "answer_similarity"
+  
+# Chatbot Configuration
+chatbot:
+  max_history: 5  # Maximum number of conversation turns to keep in history
+  system_prompt: "You are a helpful assistant that answers questions based on the provided context."
+  max_context_docs: 2
+  max_document_length: 320
+  max_prompt_tokens: 540
