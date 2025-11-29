@@ -2,15 +2,15 @@
 
 # Vector Store Configuration
 vector_store:
-  type: "chromadb"
-  persist_directory: "./chroma_db"
+  type: "faiss"
+  persist_directory: "./faiss_index"
   collection_name: "document_collection"
 
 # Embedding Model Configuration
 embedding_model:
   provider: "huggingface"
   model_name: "sentence-transformers/all-MiniLM-L6-v2"
-  device: "cpu"  # Change to "cuda" if GPU is available
+  device: "cpu" 
 
 # Document Processing Configuration
 document_processing:
